@@ -26,29 +26,14 @@ Works on:
 
 # Current Supported File Types
 
-## Images
-
-- jpg
-- jpeg
-- png
-- gif
-- bmp
-- webp
-- tiff
-- heic
-- dng
-  
-## Videos
-
-- mp4
-- mkv
-- avi
-- mov
-- wmv
-- flv
-- webm
-- m4v
-- 3gp
+- Images
+- Videos
+- Documents
+- Music
+- Programs
+- Compressed
+- Code
+- Duplicate
 
 
 # Installation Guide 
