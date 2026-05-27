@@ -54,9 +54,9 @@ Works on:
 
 ## 1. Clone Repository
 
-git clone https://github.com/torekultushar/De-Duplicate.git
+'git clone https://github.com/torekultushar/De-Duplicate.git'
 
-cd De-Duplicate
+'cd De-Duplicate'
 
 ## 2. Install Python
 
@@ -65,29 +65,19 @@ Download Python:
 https://www.python.org/downloads/
 
 Check version:
-
-python --version
+'python --version'
 
 ## 3. Install Requirements
-
-pip install -r requirements.txt
-
-# Usage
-
-Put all files inside the Raw folder.
-Run the script.
+'pip install -r requirements.txt'
 
 # Windows
-
-python main.py
+'python main.py'
 
 # Linux / macOS
-
-python3 main.py
+'python3 main.py'
 
 # Termux
-
-python main.py
+'python main.py'
 
 # How Duplicate Detection Works 
 
@@ -96,6 +86,10 @@ The script does NOT compare filenames.
 Instead, it generates a SHA256 hash from the actual file content.
 It creates a unique digital fingerprint for every file.
 
-# Requirements
+# Usage
 
+Put all files inside the Raw folder.
+Run the script.
+
+# Requirements
 Python 3.8+
