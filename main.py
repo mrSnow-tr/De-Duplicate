@@ -64,7 +64,7 @@ IMAGE_EXTENSIONS = {
 
 VIDEO_EXTENSIONS = {
     ".mp4", ".mkv", ".avi", ".mov",
-    ".wmv", ".flv", ".webm", ".m4v"
+    ".wmv", ".flv", ".webm", ".m4v",".3gp"
 }
 
 
