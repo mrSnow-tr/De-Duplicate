@@ -4,12 +4,9 @@ import shutil
 import platform
 import threading
 import time
+import sqlite3
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-# =========================
-# OPTIONAL PROGRESS BAR
-# =========================
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 try:
     from tqdm import tqdm
@@ -18,131 +15,118 @@ except ImportError:
 
 
 # =========================
-# SPEED CONFIG
+# CONFIG
 # =========================
 
 MAX_WORKERS = min(32, (os.cpu_count() or 4) * 2)
-MIN_FILE_SIZE = 5 * 1024
+MIN_FILE_SIZE = 5 * 1024  # 5kb minimum limit
+QUEUE_LIMIT = MAX_WORKERS * 40
 
 
 # =========================
-# FILE CATEGORIES
+# SQLITE (UNDO SYSTEM)
 # =========================
-# (unchanged - your full list kept)
+
+DB_FILE = "basic.db"
+db_conn = None
+db_lock = threading.Lock()
+
+
+def init_db():
+    global db_conn
+    db_conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    db_conn.execute("PRAGMA journal_mode=WAL")
+
+    db_conn.execute("""
+        CREATE TABLE IF NOT EXISTS moves (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            original_path TEXT,
+            moved_path TEXT,
+            action TEXT,
+            timestamp REAL
+        )
+    """)
+    db_conn.commit()
+
+
+def clear_db():
+    db_conn.execute("DELETE FROM moves")
+    db_conn.commit()
+
+
+def log_move(o, m, a):
+    with db_lock:
+        db_conn.execute(
+            "INSERT INTO moves VALUES (NULL, ?, ?, ?, ?)",
+            (str(o), str(m), a, time.time())
+        )
+        db_conn.commit()
+
+
+# =========================
+# FILE TYPES
 # =========================
 
 FILE_CATEGORIES = {
     "Images": {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"},
     "Videos": {".mp4", ".avi", ".mov", ".webm"},
     "Documents": {".pdf", ".doc", ".docx", ".txt"},
-    "Recording": { ".wav", ".aac", ".flac"},
-    "Movies": { ".mkv", ".3gp", ".m4v"},
-    "Music": { ".mp3", ".m4a" },
-    "Programs": { ".exe", ".msi", ".apk", ".deb",".rpm", ".pkg" }, 
-    "Compressed": { ".zip ", ".rar", ".7z", ".tar", ".gz", ".tgz" },
-    "Torrents": { ".torrent"},
-    "Subtitles": { ".srt", ".ass", ".ssa", ".sub", ".vtt"}
+    "Recording": {".wav", ".aac", ".flac"},
+    "Movies": {".mkv", ".3gp", ".m4v"},
+    "Music": {".mp3", ".m4a"},
+    "Programs": {".exe", ".msi", ".apk", ".deb", ".rpm", ".pkg"},
+    "Compressed": {".zip", ".rar", ".7z", ".tar", ".gz", ".tgz"},
+    "Torrents": {".torrent"},
+    "Subtitles": {".srt", ".ass", ".ssa", ".sub", ".vtt"}
 }
 
-SUPPORTED_EXTENSIONS = {ext for exts in FILE_CATEGORIES.values() for ext in exts}
+SUPPORTED = {e for s in FILE_CATEGORIES.values() for e in s}
 
 
 # =========================
-# SYSTEM DETECTION
+# SYSTEM
 # =========================
 
 def is_android():
     return "ANDROID_ROOT" in os.environ or "ANDROID_DATA" in os.environ
 
 
-# =========================
-# SCAN ROOTS
-# =========================
-
-def get_scan_roots():
+def scan_roots():
     if is_android():
         return [Path("/storage/emulated/0")]
 
     system = platform.system()
-    roots = []
 
     if system == "Windows":
-        for d in "DEFGHIJKLMNOPQRSTUVWXYZ":
-            drive = Path(f"{d}:\\")
-            if drive.exists():
-                roots.append(drive)
-        roots.append(Path.home() / "Downloads")
+        return [Path(f"{d}:\\") for d in "DEFGHIJKLMNOPQRSTUVWXYZ" if Path(f"{d}:\\").exists()] + [Path.home() / "Downloads"]
 
-    elif system == "Darwin":
-        volumes = Path("/Volumes")
-        if volumes.exists():
-            roots += [p for p in volumes.iterdir() if p.is_dir()]
-        roots.append(Path.home() / "Downloads")
-
-    else:
-        roots.append(Path.home() / "Downloads")
-        roots += [p for p in Path("/mnt").glob("*")]
-
-    return roots
+    return [Path.home() / "Downloads"]
 
 
-# =========================
-# DESTINATION DRIVE
-# =========================
-
-def get_best_drive():
+def best_drive():
     if is_android():
         return Path("/storage/emulated/0")
-
-    if platform.system() == "Windows":
-        best = Path("C:\\")
-        max_free = 0
-
-        for d in "DEFGHIJKLMNOPQRSTUVWXYZ":
-            drive = f"{d}:\\"
-            if os.path.exists(drive):
-                free = shutil.disk_usage(drive).free
-                if free > max_free:
-                    max_free = free
-                    best = Path(drive)
-
-        return best
-
     return Path.home()
 
 
-# =========================
-# FOLDERS
-# =========================
-
-def build_folders():
-    root = get_best_drive()
-
+def make_folders():
+    root = best_drive()
     dup = root / "Duplicates"
     corrupt = root / "Corrupted"
-
     dup.mkdir(exist_ok=True)
     corrupt.mkdir(exist_ok=True)
-
-    print(f"\n[INFO] Duplicates: {dup}")
-    print(f"[INFO] Corrupted : {corrupt}\n")
-
     return dup, corrupt
 
 
 # =========================
-# FILTERS
+# FILTERS (FAST PRECHECK FIRST)
 # =========================
 
-def is_hidden(path):
-    return path.name.startswith(".")
-
-
-def is_valid_file(path):
+def valid_file(p):
     return (
-        path.is_file()
-        and not is_hidden(path)
-        and path.suffix.lower() in SUPPORTED_EXTENSIONS
+        p.is_file()
+        and not p.name.startswith(".")
+        and p.suffix.lower() in SUPPORTED
     )
 
 
@@ -150,15 +134,13 @@ def is_valid_file(path):
 # HASHING
 # =========================
 
-def file_hash(path):
-    sha = hashlib.sha256()
-
+def hash_file(path):
+    h = hashlib.sha256()
     try:
         with open(path, "rb") as f:
             while chunk := f.read(1024 * 1024):
-                sha.update(chunk)
-        return sha.hexdigest()
-
+                h.update(chunk)
+        return h.hexdigest()
     except:
         return None
 
@@ -167,56 +149,45 @@ def file_hash(path):
 # CORRUPTION CHECK
 # =========================
 
-def is_corrupted(path):
+def corrupted(p):
     try:
-        if path.stat().st_size == 0:
+        if p.stat().st_size == 0:
             return True
-
-        with open(path, "rb") as f:
-            f.read(1024)
+        with open(p, "rb") as f:
+            f.read(512)
         return False
-
     except:
         return True
 
 
 # =========================
-# SMART PATH SCORE (IMPROVED)
+# SCORE SYSTEM
 # =========================
 
-def path_score(path: Path) -> int:
-    p = str(path).lower()
-    score = 0
+def score(p: Path):
+    s = 0
+    sp = str(p).lower()
 
-    # ORIGINAL SOURCE INDICATORS
-    if any(x in p for x in ["dcim", "camera", "images", "pictures"]):
-        score += 120
+    if "camera" in sp or "dcim" in sp:
+        s += 100
+    if "downloads" in sp:
+        s += 50
+    if "cache" in sp or "temp" in sp:
+        s -= 70
 
-    if "downloads" in p:
-        score += 60
-
-    if any(x in p for x in ["messenger", "whatsapp", "telegram", "cache", "temp"]):
-        score -= 80
-
-    # depth rule (shallower = more original)
-    depth = len(path.parts)
-    score += max(0, 50 - depth)
-
-    # file age (OLDER = likely original)
     try:
-        age = time.time() - path.stat().st_mtime
-        score += min(50, age / 86400)  # days bonus
+        s += max(0, 30 - len(p.parts))
     except:
         pass
 
-    return score
+    return s
 
 
 # =========================
-# SAFE MOVE
+# SAFE MOVE + LOG
 # =========================
 
-def safe_move(src, folder):
+def move(src, folder, action):
     dest = folder / src.name
     i = 1
 
@@ -224,38 +195,23 @@ def safe_move(src, folder):
         dest = folder / f"{src.stem}_{i}{src.suffix}"
         i += 1
 
-    shutil.move(str(src), str(dest))
+    try:
+        log_move(src, dest, action)
+        shutil.move(str(src), str(dest))
+    except:
+        pass
 
 
 # =========================
-# CLEAN EMPTY FOLDERS
+# STREAM FILE GENERATOR (ULTRA FAST)
 # =========================
 
-def clean_empty_dirs(root):
-    for path in sorted(Path(root).rglob("*"), reverse=True):
-        if path.is_dir():
-            try:
-                if not any(path.iterdir()):
-                    path.rmdir()
-            except:
-                pass
-
-
-# =========================
-# COLLECT FILES
-# =========================
-
-def collect_files():
-    files = []
-
-    for root in get_scan_roots():
+def stream_files():
+    for root in scan_roots():
         if not root.exists():
             continue
 
         for cur, _, names in os.walk(root):
-            if is_android() and "Android" in cur:
-                continue
-
             for n in names:
                 p = Path(cur) / n
 
@@ -265,97 +221,165 @@ def collect_files():
                 except:
                     continue
 
-                if is_valid_file(p):
-                    files.append(p)
-
-    return files
+                if valid_file(p):
+                    yield p
 
 
 # =========================
-# CORE LOGIC (GROUP + BEST KEEP)
+# CORE PROCESSOR (FAST PATH + CACHE)
 # =========================
 
-def process_file(path, lock, dup_folder, corrupt_folder, db):
-    if is_corrupted(path):
-        safe_move(path, corrupt_folder)
+hash_cache = {}
+db = {}
+db_lock_mem = threading.Lock()
+
+
+def process_file(path, dup_folder, corrupt_folder):
+
+    if corrupted(path):
+        move(path, corrupt_folder, "corrupt")
         return "corrupt"
 
-    digest = file_hash(path)
-    if not digest:
+    h = hash_cache.get(path)
+
+    if not h:
+        h = hash_file(path)
+        hash_cache[path] = h
+
+    if not h:
         return "skip"
 
-    score = path_score(path)
+    s = score(path)
 
-    with lock:
+    with db_lock_mem:
 
-        if digest not in db:
-            db[digest] = path
+        if h not in db:
+            db[h] = path
             return "unique"
 
-        existing = db[digest]
+        existing = db[h]
 
-        # 4+ duplicates handled naturally via grouping in dict
-        if score > path_score(existing):
-            safe_move(existing, dup_folder)
-            db[digest] = path
+        if s > score(existing):
+            move(existing, dup_folder, "duplicate")
+            db[h] = path
             return "replaced"
+
         else:
-            safe_move(path, dup_folder)
+            move(path, dup_folder, "duplicate")
             return "duplicate"
 
 
 # =========================
-# MAIN
+# ULTRA ENGINE SCANNER
 # =========================
 
-def run_basic_mode():
+def run_full_scan():
+
+    clear_db()
 
     print("\n==============================")
-    print("   DUPLICATE FINDER STARTED")
+    print("   BASIC ENGINE")
     print("==============================\n")
 
-    files = collect_files()
+    dup_folder, corrupt_folder = make_folders()
 
-    print(f"[INFO] Files found: {len(files)}")
-    print(f"[INFO] Workers: {MAX_WORKERS}\n")
+    stats = {"unique": 0, "duplicate": 0, "replaced": 0, "corrupt": 0, "skip": 0}
 
-    dup_folder, corrupt_folder = build_folders()
+    futures = set()
 
-    lock = threading.Lock()
-    db = {}
-
-    stats = {
-        "unique": 0,
-        "duplicate": 0,
-        "replaced": 0,
-        "corrupt": 0,
-        "skip": 0
-    }
+    if tqdm:
+        pbar = tqdm(desc="Scanning", unit="file")
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = [
-            ex.submit(process_file, f, lock, dup_folder, corrupt_folder, db)
-            for f in files
-        ]
 
-        iterator = as_completed(futures)
+        for file in stream_files():
 
-        if tqdm:
-            iterator = tqdm(iterator, total=len(futures), desc="Scanning")
+            futures.add(ex.submit(process_file, file, dup_folder, corrupt_folder))
 
-        for f in iterator:
+            # backpressure control (VERY IMPORTANT)
+            if len(futures) >= QUEUE_LIMIT:
+
+                done, futures = wait(futures, return_when=FIRST_COMPLETED)
+
+                for d in done:
+                    r = d.result()
+                    if r in stats:
+                        stats[r] += 1
+                        if tqdm:
+                            pbar.update(1)
+
+        # flush remaining
+        for f in futures:
             r = f.result()
             if r in stats:
                 stats[r] += 1
+                if tqdm:
+                    pbar.update(1)
 
-    # CLEANUP
-    for root in get_scan_roots():
-        clean_empty_dirs(root)
+    if tqdm:
+        pbar.close()
 
     print("\n==============================")
     print("        SUMMARY")
-    print("==============================")
     print(stats)
-    print(f"\n📁 Duplicates: {dup_folder}")
-    print(f"⚠️ Corrupted : {corrupt_folder}")
     print("\n[DONE]")
+
+
+# =========================
+# MENU
+# =========================
+
+def undo_last_session():
+    print("\n[UNDO] Restoring...")
+
+    rows = db_conn.execute(
+        "SELECT original_path, moved_path FROM moves ORDER BY id DESC"
+    ).fetchall()
+
+    count = 0
+
+    for o, m in rows:
+        op, mp = Path(o), Path(m)
+
+        try:
+            if mp.exists():
+                op.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(mp), str(op))
+                count += 1
+        except:
+            pass
+
+    db_conn.execute("DELETE FROM moves")
+    db_conn.commit()
+
+    print(f"[DONE] Restored {count} files\n")
+
+
+def basic_menu():
+    while True:
+        print("\n1. Full scan     -> Scan everything and filter duplicates")
+        print("2. Undo previous -> Undo everything from previous scan")
+        print("3. Exit or e     -> Exit or Quite the Duplicate finder")
+
+        choice = input("\nEnter your selection: ").strip().lower()
+
+        if choice in ("full", "1", "f"):
+            run_full_scan()
+
+        elif choice in ("undo", "2", "u"):
+            undo_last_session()
+
+        elif choice in ("exit", "e", "3"):
+            break
+
+        else:
+            print("Invalid option")
+
+
+# =========================
+# MAIN ENTRY FOR main.py
+# =========================
+
+def run_basic_mode():
+	init_db(),
+	basic_menu()
